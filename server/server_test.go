@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sort"
 	"testing"
@@ -375,6 +377,321 @@ func TestMCPServer_Tools(t *testing.T) {
 			tt.validate(t, notifications, toolsList)
 		})
 	}
+}
+
+func TestMCPServer_DynamicToolsSupport(t *testing.T) {
+	// Available tool definitions that can be dynamically provided
+	availableTools := map[string]mcp.Tool{
+		"calc-add": mcp.NewTool("calc-add",
+			mcp.WithDescription("Add two numbers"),
+			mcp.WithNumber("x", mcp.Required(), mcp.Description("First number")),
+			mcp.WithNumber("y", mcp.Required(), mcp.Description("Second number")),
+		),
+		"calc-multiply": mcp.NewTool("calc-multiply",
+			mcp.WithDescription("Multiply two numbers"),
+			mcp.WithNumber("x", mcp.Required(), mcp.Description("First number")),
+			mcp.WithNumber("y", mcp.Required(), mcp.Description("Second number")),
+		),
+		"text-echo": mcp.NewTool("text-echo",
+			mcp.WithDescription("Echo back the input text"),
+			mcp.WithString("message", mcp.Required(), mcp.Description("Message to echo")),
+		),
+	}
+
+	// Dynamic tool list function - returns tools based on request context
+	listFunc := func(ctx context.Context, request mcp.ListToolsRequest) ([]mcp.Tool, error) {
+		tools := []mcp.Tool{
+			availableTools["calc-add"],
+			availableTools["calc-multiply"],
+			availableTools["text-echo"],
+		}
+		return tools, nil
+	}
+
+	// Dynamic tool validation function
+	validateFunc := func(ctx context.Context, toolName string) bool {
+		_, exists := availableTools[toolName]
+		return exists
+	}
+
+	// Dynamic tool handler function
+	handlerFunc := func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		switch request.Params.Name {
+		case "calc-add":
+			x, err := request.RequireFloat("x")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			y, err := request.RequireFloat("y")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			result := x + y
+			return mcp.NewToolResultText(fmt.Sprintf("%.2f", result)), nil
+
+		case "calc-multiply":
+			x, err := request.RequireFloat("x")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			y, err := request.RequireFloat("y")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			result := x * y
+			return mcp.NewToolResultText(fmt.Sprintf("%.2f", result)), nil
+
+		case "text-echo":
+			message, err := request.RequireString("message")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Echo: %s", message)), nil
+
+		default:
+			return mcp.NewToolResultError("Unknown dynamic tool"), nil
+		}
+	}
+
+	// Create server with dynamic tools enabled
+	mcpServer := NewMCPServer("dynamic-tools-test", "1.0.0",
+		WithDynamicTools(true, listFunc, handlerFunc, validateFunc),
+	)
+
+	// Add one static tool for comparison
+	mcpServer.AddTool(
+		mcp.NewTool("static-tool",
+			mcp.WithDescription("A static tool for comparison"),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("Static tool executed"), nil
+		},
+	)
+
+	// Create streamable HTTP test server
+	testServer := NewTestStreamableHTTPServer(mcpServer, WithStateLess(true))
+	defer testServer.Close()
+
+	makeRequest := func(method string, id int, params map[string]any) (*http.Response, error) {
+		request := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"method":  method,
+		}
+		if params != nil {
+			request["params"] = params
+		}
+
+		jsonData, _ := json.Marshal(request)
+		return http.Post(testServer.URL, "application/json", bytes.NewBuffer(jsonData))
+	}
+
+	// Test 1: Initialize the server
+	t.Run("Initialize", func(t *testing.T) {
+		resp, err := makeRequest("initialize", 1, map[string]any{
+			"protocolVersion": "2025-03-26",
+			"clientInfo": map[string]any{
+				"name":    "test-client",
+				"version": "1.0.0",
+			},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		assert.Equal(t, "2025-03-26", result["protocolVersion"])
+	})
+
+	// Test 2: List tools (should include both static and dynamic tools)
+	t.Run("ListTools", func(t *testing.T) {
+		resp, err := makeRequest("tools/list", 2, nil)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		tools := result["tools"].([]any)
+
+		// Should have 4 tools: 1 static + 3 dynamic
+		assert.Len(t, tools, 4)
+
+		toolNames := make([]string, len(tools))
+		for i, tool := range tools {
+			toolMap := tool.(map[string]any)
+			toolNames[i] = toolMap["name"].(string)
+		}
+
+		// Check that all expected tools are present
+		assert.Contains(t, toolNames, "static-tool")
+		assert.Contains(t, toolNames, "calc-add")
+		assert.Contains(t, toolNames, "calc-multiply")
+		assert.Contains(t, toolNames, "text-echo")
+	})
+
+	// Test 3: Call dynamic tool - calc-add
+	t.Run("CallDynamicTool_Add", func(t *testing.T) {
+		resp, err := makeRequest("tools/call", 3, map[string]any{
+			"name": "calc-add",
+			"arguments": map[string]any{
+				"x": 15.5,
+				"y": 24.3,
+			},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		content := result["content"].([]any)
+		assert.Len(t, content, 1)
+
+		textContent := content[0].(map[string]any)
+		assert.Equal(t, "text", textContent["type"])
+		assert.Equal(t, "39.80", textContent["text"])
+	})
+
+	// Test 4: Call dynamic tool - calc-multiply
+	t.Run("CallDynamicTool_Multiply", func(t *testing.T) {
+		resp, err := makeRequest("tools/call", 4, map[string]any{
+			"name": "calc-multiply",
+			"arguments": map[string]any{
+				"x": 6,
+				"y": 7,
+			},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		content := result["content"].([]any)
+		assert.Len(t, content, 1)
+
+		textContent := content[0].(map[string]any)
+		assert.Equal(t, "text", textContent["type"])
+		assert.Equal(t, "42.00", textContent["text"])
+	})
+
+	// Test 5: Call dynamic tool - text-echo
+	t.Run("CallDynamicTool_Echo", func(t *testing.T) {
+		resp, err := makeRequest("tools/call", 5, map[string]any{
+			"name": "text-echo",
+			"arguments": map[string]any{
+				"message": "Hello Dynamic Tools!",
+			},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		content := result["content"].([]any)
+		assert.Len(t, content, 1)
+
+		textContent := content[0].(map[string]any)
+		assert.Equal(t, "text", textContent["type"])
+		assert.Equal(t, "Echo: Hello Dynamic Tools!", textContent["text"])
+	})
+
+	// Test 6: Call static tool for comparison
+	t.Run("CallStaticTool", func(t *testing.T) {
+		resp, err := makeRequest("tools/call", 6, map[string]any{
+			"name":      "static-tool",
+			"arguments": map[string]any{},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		content := result["content"].([]any)
+		assert.Len(t, content, 1)
+
+		textContent := content[0].(map[string]any)
+		assert.Equal(t, "text", textContent["type"])
+		assert.Equal(t, "Static tool executed", textContent["text"])
+	})
+
+	// Test 7: Call non-existent dynamic tool (should fail validation)
+	t.Run("CallNonExistentDynamicTool", func(t *testing.T) {
+		resp, err := makeRequest("tools/call", 7, map[string]any{
+			"name":      "non-existent-tool",
+			"arguments": map[string]any{},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		// Should return an error response
+		errorResponse := jsonResp["error"].(map[string]any)
+		assert.Equal(t, float64(mcp.INVALID_PARAMS), errorResponse["code"])
+		assert.Contains(t, errorResponse["message"], "tool 'non-existent-tool' not found")
+	})
+
+	// Test 8: Test error handling in dynamic tools
+	t.Run("DynamicToolErrorHandling", func(t *testing.T) {
+		resp, err := makeRequest("tools/call", 8, map[string]any{
+			"name": "calc-add",
+			"arguments": map[string]any{
+				"x": "invalid", // Should cause error
+				"y": 5,
+			},
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var jsonResp map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&jsonResp)
+		require.NoError(t, err)
+
+		result := jsonResp["result"].(map[string]any)
+		assert.Equal(t, true, result["isError"])
+
+		content := result["content"].([]any)
+		assert.Len(t, content, 1)
+
+		textContent := content[0].(map[string]any)
+		assert.Equal(t, "text", textContent["type"])
+		assert.Contains(t, textContent["text"], "cannot be converted to float64")
+	})
 }
 
 func TestMCPServer_HandleValidMessages(t *testing.T) {

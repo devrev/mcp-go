@@ -991,7 +991,6 @@ func (s *MCPServer) handleListTools(
 		}
 
 		if len(dynamicTools) > 0 {
-			// Create a map to merge tools properly
 			toolMap := make(map[string]mcp.Tool)
 
 			// Add dynamic tools first (lowest priority)
@@ -1004,7 +1003,6 @@ func (s *MCPServer) handleListTools(
 				toolMap[tool.Name] = tool
 			}
 
-			// Convert back to slice
 			tools = make([]mcp.Tool, 0, len(toolMap))
 			for _, tool := range toolMap {
 				tools = append(tools, tool)
@@ -1081,9 +1079,7 @@ func (s *MCPServer) handleToolCall(
 
 	// If still not found, try dynamic tool handler
 	if !ok && s.dynamicTools != nil && s.dynamicTools.enabled {
-		// Check if this tool is valid using the validation function
 		if s.dynamicTools.validateFunc(ctx, request.Params.Name) {
-			// Create a ServerTool with the dynamic handler
 			tool = ServerTool{
 				Handler: s.dynamicTools.handlerFunc,
 			}
