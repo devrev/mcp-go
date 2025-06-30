@@ -377,6 +377,333 @@ func TestMCPServer_Tools(t *testing.T) {
 	}
 }
 
+func TestMCPServer_DynamicToolsSupport(t *testing.T) {
+	// Available tool definitions that can be dynamically provided
+	availableTools := map[string]mcp.Tool{
+		"calc-add": mcp.NewTool("calc-add",
+			mcp.WithDescription("Add two numbers"),
+			mcp.WithNumber("x", mcp.Required(), mcp.Description("First number")),
+			mcp.WithNumber("y", mcp.Required(), mcp.Description("Second number")),
+		),
+		"calc-multiply": mcp.NewTool("calc-multiply",
+			mcp.WithDescription("Multiply two numbers"),
+			mcp.WithNumber("x", mcp.Required(), mcp.Description("First number")),
+			mcp.WithNumber("y", mcp.Required(), mcp.Description("Second number")),
+		),
+		"text-echo": mcp.NewTool("text-echo",
+			mcp.WithDescription("Echo back the input text"),
+			mcp.WithString("message", mcp.Required(), mcp.Description("Message to echo")),
+		),
+		// Add a tool that will be overridden by static and session tools
+		"override-test": mcp.NewTool("override-test",
+			mcp.WithDescription("Dynamic tool to test override logic"),
+			mcp.WithString("message", mcp.Required(), mcp.Description("Message to echo")),
+		),
+	}
+
+	// Dynamic tool list function - returns tools based on request context
+	listFunc := func(ctx context.Context, request mcp.ListToolsRequest) ([]mcp.Tool, error) {
+		tools := []mcp.Tool{
+			availableTools["calc-add"],
+			availableTools["calc-multiply"],
+			availableTools["text-echo"],
+			availableTools["override-test"],
+		}
+		return tools, nil
+	}
+
+	// Dynamic tool validation function
+	validateFunc := func(ctx context.Context, toolName string) bool {
+		_, exists := availableTools[toolName]
+		return exists
+	}
+
+	// Dynamic tool handler function
+	handlerFunc := func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		switch request.Params.Name {
+		case "calc-add":
+			x, err := request.RequireFloat("x")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			y, err := request.RequireFloat("y")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			result := x + y
+			return mcp.NewToolResultText(fmt.Sprintf("%.2f", result)), nil
+
+		case "calc-multiply":
+			x, err := request.RequireFloat("x")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			y, err := request.RequireFloat("y")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			result := x * y
+			return mcp.NewToolResultText(fmt.Sprintf("%.2f", result)), nil
+
+		case "text-echo":
+			message, err := request.RequireString("message")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Echo: %s", message)), nil
+
+		case "override-test":
+			message, err := request.RequireString("message")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Dynamic: %s", message)), nil
+
+		default:
+			return mcp.NewToolResultError("Unknown dynamic tool"), nil
+		}
+	}
+
+	// Create server with dynamic tools enabled
+	mcpServer := NewMCPServer("dynamic-tools-test", "1.0.0",
+		WithDynamicTools(true, listFunc, handlerFunc, validateFunc),
+		WithToolCapabilities(true),
+	)
+
+	// Add static tools including one that overrides a dynamic tool
+	mcpServer.AddTool(
+		mcp.NewTool("static-tool",
+			mcp.WithDescription("A static tool for comparison"),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("Static tool executed"), nil
+		},
+	)
+
+	mcpServer.AddTool(
+		mcp.NewTool("override-test",
+			mcp.WithDescription("Static tool that overrides dynamic tool"),
+			mcp.WithString("message", mcp.Required(), mcp.Description("Message to echo")),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			message, err := request.RequireString("message")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Static: %s", message)), nil
+		},
+	)
+
+	// Initialize the server
+	ctx := context.Background()
+	_ = mcpServer.HandleMessage(ctx, []byte(`{
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "initialize"
+	}`))
+
+	// Test 1: List tools (should include both static and dynamic tools)
+	t.Run("ListTools", func(t *testing.T) {
+		response := mcpServer.HandleMessage(ctx, []byte(`{
+			"jsonrpc": "2.0",
+			"id": 2,
+			"method": "tools/list"
+		}`))
+
+		require.NotNil(t, response)
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok)
+
+		result, ok := resp.Result.(mcp.ListToolsResult)
+		require.True(t, ok)
+
+		// Should have 5 tools total (2 static + 3 dynamic, with override-test appearing once)
+		assert.Len(t, result.Tools, 5)
+
+		// Verify that override-test tool shows the static tool's description
+		var overrideToolFound bool
+		for _, tool := range result.Tools {
+			if tool.Name == "override-test" {
+				overrideToolFound = true
+				assert.Equal(t, "Static tool that overrides dynamic tool", tool.Description)
+			}
+		}
+		assert.True(t, overrideToolFound)
+	})
+
+	// Test 2: Test override logic - static tool overrides dynamic tool
+	t.Run("TestOverrideLogic_StaticOverridesDynamic", func(t *testing.T) {
+		response := mcpServer.HandleMessage(ctx, []byte(`{
+			"jsonrpc": "2.0",
+			"id": 3,
+			"method": "tools/call",
+			"params": {
+				"name": "override-test",
+				"arguments": {
+					"message": "Test Message"
+				}
+			}
+		}`))
+
+		require.NotNil(t, response)
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok)
+
+		result, ok := resp.Result.(mcp.CallToolResult)
+		require.True(t, ok)
+
+		require.Len(t, result.Content, 1)
+		textContent, ok := result.Content[0].(mcp.TextContent)
+		require.True(t, ok)
+
+		// Should get response from static tool, not dynamic tool
+		assert.Equal(t, "Static: Test Message", textContent.Text)
+	})
+
+	// Test 3: Test override logic - session tool overrides both static and dynamic tools
+	t.Run("TestOverrideLogic_SessionOverridesAll", func(t *testing.T) {
+		// Create a session with a tool that overrides both static and dynamic tools
+		sessionTools := make(map[string]ServerTool)
+		sessionTools["override-test"] = ServerTool{
+			Tool: mcp.NewTool("override-test",
+				mcp.WithDescription("Session tool that overrides static and dynamic tools"),
+				mcp.WithString("message", mcp.Required(), mcp.Description("Message to echo")),
+			),
+			Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				message, err := request.RequireString("message")
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				return mcp.NewToolResultText(fmt.Sprintf("Session: %s", message)), nil
+			},
+		}
+
+		// Create a session that implements SessionWithTools
+		session := &testSession{
+			id:           "test-session",
+			tools:        sessionTools,
+			initialized:  true,
+			notifChannel: make(chan mcp.JSONRPCNotification, 10),
+		}
+
+		// Register the session
+		err := mcpServer.RegisterSession(ctx, session)
+		require.NoError(t, err)
+
+		// Create a context with this session
+		sessionCtx := mcpServer.WithContext(ctx, session)
+
+		// Make the request with the session context
+		response := mcpServer.HandleMessage(sessionCtx, []byte(`{
+			"jsonrpc": "2.0",
+			"id": 4,
+			"method": "tools/call",
+			"params": {
+				"name": "override-test",
+				"arguments": {
+					"message": "Test Message"
+				}
+			}
+		}`))
+
+		require.NotNil(t, response)
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok)
+
+		result, ok := resp.Result.(mcp.CallToolResult)
+		require.True(t, ok)
+
+		require.Len(t, result.Content, 1)
+		textContent, ok := result.Content[0].(mcp.TextContent)
+		require.True(t, ok)
+
+		// Should get response from session tool, not static or dynamic tool
+		assert.Equal(t, "Session: Test Message", textContent.Text)
+
+		// Clean up
+		mcpServer.UnregisterSession(ctx, session.SessionID())
+	})
+
+	// Test 4: Test listing tools with session context - session tool should override static and dynamic tools
+	t.Run("TestListTools_SessionOverridesAll", func(t *testing.T) {
+		// Create a session with a tool that overrides both static and dynamic tools
+		sessionTools := make(map[string]ServerTool)
+		sessionTools["override-test"] = ServerTool{
+			Tool: mcp.NewTool("override-test",
+				mcp.WithDescription("Session tool that overrides static and dynamic tools"),
+				mcp.WithString("message", mcp.Required(), mcp.Description("Message to echo")),
+			),
+			Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				message, err := request.RequireString("message")
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				return mcp.NewToolResultText(fmt.Sprintf("Session: %s", message)), nil
+			},
+		}
+
+		// Create a session that implements SessionWithTools
+		session := &testSession{
+			id:           "test-session-list",
+			tools:        sessionTools,
+			initialized:  true,
+			notifChannel: make(chan mcp.JSONRPCNotification, 10),
+		}
+
+		// Register the session
+		err := mcpServer.RegisterSession(ctx, session)
+		require.NoError(t, err)
+
+		// Create a context with this session
+		sessionCtx := mcpServer.WithContext(ctx, session)
+
+		// List tools with the session context
+		response := mcpServer.HandleMessage(sessionCtx, []byte(`{
+			"jsonrpc": "2.0",
+			"id": 5,
+			"method": "tools/list"
+		}`))
+
+		require.NotNil(t, response)
+		resp, ok := response.(mcp.JSONRPCResponse)
+		require.True(t, ok)
+
+		result, ok := resp.Result.(mcp.ListToolsResult)
+		require.True(t, ok)
+
+		// Should have 5 tools total (2 static + 3 dynamic, with override-test appearing once)
+		assert.Len(t, result.Tools, 5)
+
+		// Verify that override-test tool shows the session tool's description
+		var overrideToolFound bool
+		for _, tool := range result.Tools {
+			if tool.Name == "override-test" {
+				overrideToolFound = true
+				assert.Equal(t, "Session tool that overrides static and dynamic tools", tool.Description)
+			}
+		}
+		assert.True(t, overrideToolFound)
+
+		// Clean up
+		mcpServer.UnregisterSession(ctx, session.SessionID())
+	})
+}
+
+// testSession is a helper for TestMCPServer_DynamicToolsSupport
+type testSession struct {
+	id           string
+	tools        map[string]ServerTool
+	initialized  bool
+	notifChannel chan mcp.JSONRPCNotification
+}
+
+func (s *testSession) SessionID() string                                   { return s.id }
+func (s *testSession) NotificationChannel() chan<- mcp.JSONRPCNotification { return s.notifChannel }
+func (s *testSession) Initialize()                                         { s.initialized = true }
+func (s *testSession) Initialized() bool                                   { return s.initialized }
+func (s *testSession) GetSessionTools() map[string]ServerTool              { return s.tools }
+func (s *testSession) SetSessionTools(tools map[string]ServerTool)         { s.tools = tools }
+
 func TestMCPServer_HandleValidMessages(t *testing.T) {
 	server := NewMCPServer("test-server", "1.0.0",
 		WithResourceCapabilities(true, true),

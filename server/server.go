@@ -46,6 +46,14 @@ type ToolHandlerMiddleware func(ToolHandlerFunc) ToolHandlerFunc
 // ToolFilterFunc is a function that filters tools based on context, typically using session information.
 type ToolFilterFunc func(ctx context.Context, tools []mcp.Tool) []mcp.Tool
 
+// dynamicToolsHandler holds configuration for dynamic tool generation
+type dynamicToolsHandler struct {
+	enabled      bool                                                                                // If enabled, all functions must be non-nil
+	listFunc     func(ctx context.Context, request mcp.ListToolsRequest) ([]mcp.Tool, error)         // Handler for listing tools
+	handlerFunc  func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) // Handler for handling tool calls
+	validateFunc func(ctx context.Context, toolName string) bool                                     // Validator for tool names
+}
+
 // ServerTool combines a Tool with its ToolHandlerFunc.
 type ServerTool struct {
 	Tool    mcp.Tool
@@ -155,6 +163,7 @@ type MCPServer struct {
 	tools                  map[string]ServerTool
 	toolHandlerMiddlewares []ToolHandlerMiddleware
 	toolFilters            []ToolFilterFunc
+	dynamicToolsHandler    *dynamicToolsHandler
 	notificationHandlers   map[string]NotificationHandlerFunc
 	capabilities           serverCapabilities
 	paginationLimit        *int
@@ -285,6 +294,32 @@ func WithLogging() ServerOption {
 func WithInstructions(instructions string) ServerOption {
 	return func(s *MCPServer) {
 		s.instructions = instructions
+	}
+}
+
+func WithDynamicTools(
+	enabled bool,
+	listFunc func(ctx context.Context, request mcp.ListToolsRequest) ([]mcp.Tool, error),
+	handlerFunc func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error),
+	validateFunc func(ctx context.Context, toolName string) bool,
+) ServerOption {
+	return func(s *MCPServer) {
+		// If enabled, all functions must be non-nil
+		if enabled && (listFunc == nil || handlerFunc == nil || validateFunc == nil) {
+			panic("WithDynamicTools: when enabled=true, all functions (listFunc, handlerFunc, validateFunc) must be non-nil")
+		}
+
+		s.dynamicToolsHandler = &dynamicToolsHandler{
+			enabled:      enabled,
+			listFunc:     listFunc,
+			handlerFunc:  handlerFunc,
+			validateFunc: validateFunc,
+		}
+
+		// Ensure capabilities.tool is not nil so that clients know tools exist
+		if enabled {
+			s.implicitlyRegisterToolCapabilities()
+		}
 	}
 }
 
@@ -944,6 +979,42 @@ func (s *MCPServer) handleListTools(
 		}
 	}
 
+	// Add dynamic tools if enabled
+	if s.dynamicToolsHandler != nil && s.dynamicToolsHandler.enabled && s.dynamicToolsHandler.listFunc != nil {
+		dynamicTools, err := s.dynamicToolsHandler.listFunc(ctx, request)
+		if err != nil {
+			return nil, &requestError{
+				id:   id,
+				code: mcp.INTERNAL_ERROR,
+				err:  fmt.Errorf("dynamic tools list function failed: %w", err),
+			}
+		}
+
+		if len(dynamicTools) > 0 {
+			toolMap := make(map[string]mcp.Tool)
+
+			// Add dynamic tools first (lowest priority)
+			for _, tool := range dynamicTools {
+				toolMap[tool.Name] = tool
+			}
+
+			// Then add existing tools (they override dynamic tools)
+			for _, tool := range tools {
+				toolMap[tool.Name] = tool
+			}
+
+			tools = make([]mcp.Tool, 0, len(toolMap))
+			for _, tool := range toolMap {
+				tools = append(tools, tool)
+			}
+
+			// Sort again to maintain consistent ordering
+			sort.Slice(tools, func(i, j int) bool {
+				return tools[i].Name < tools[j].Name
+			})
+		}
+	}
+
 	// Apply tool filters if any are defined
 	s.toolFiltersMu.RLock()
 	if len(s.toolFilters) > 0 {
@@ -1004,6 +1075,16 @@ func (s *MCPServer) handleToolCall(
 		s.toolsMu.RLock()
 		tool, ok = s.tools[request.Params.Name]
 		s.toolsMu.RUnlock()
+	}
+
+	// If still not found, try dynamic tool handler
+	if !ok && s.dynamicToolsHandler != nil && s.dynamicToolsHandler.enabled && s.dynamicToolsHandler.validateFunc != nil && s.dynamicToolsHandler.handlerFunc != nil {
+		if s.dynamicToolsHandler.validateFunc(ctx, request.Params.Name) {
+			tool = ServerTool{
+				Handler: s.dynamicToolsHandler.handlerFunc,
+			}
+			ok = true
+		}
 	}
 
 	if !ok {
